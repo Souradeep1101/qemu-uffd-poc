@@ -16,13 +16,22 @@
 #define NUM_PAGES 1024
 #define FILE_NAME "snapshot.bin"
 
+struct thread_ctx {
+    int uffd;
+    int snapshot_fd;
+    uint64_t ram_base;
+};
+
 pthread_mutex_t ready_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t ready_cond = PTHREAD_COND_INITIALIZER;
 int is_thread_ready = 0;
 
 void *fault_handler_thread(void *arg) 
 {
-    int uffd = (int)(uintptr_t)arg;
+    struct thread_ctx *ctx = (struct thread_ctx *)arg;
+    int uffd = ctx->uffd;
+    int snapshot_fd = ctx->snapshot_fd;
+    uint64_t ram_base = ctx->ram_base;
     struct pollfd pollfd;
     pollfd.fd = uffd;
     pollfd.events = POLLIN;
@@ -71,8 +80,36 @@ void *fault_handler_thread(void *arg)
             printf("Listener: The main thread is stalled trying to access address: 0x%lx\n", 
                    (unsigned long)fault_addr);
             fflush(stdout);
+
+            uint64_t file_offset = fault_addr - ram_base;
+            printf("Listener: Calculated file offset: 0x%lx\n", (unsigned long)file_offset);
+
+            uint8_t page_buffer[PAGE_SIZE];
+            ssize_t read_bytes = pread(snapshot_fd, page_buffer, PAGE_SIZE, file_offset);
+            if (read_bytes != PAGE_SIZE) {
+                perror("Error: pread failed or read less than PAGE_SIZE");
+                pthread_exit(NULL);
+            }
+
+            struct uffdio_copy copy_req;
+            copy_req.src = (uint64_t)page_buffer;
+            copy_req.dst = fault_addr;
+            copy_req.len = PAGE_SIZE;
+            copy_req.mode = 0;
+            copy_req.copy = 0;
+
+            printf("Listener: Injecting page via UFFDIO_COPY...\n");
+
+            if (ioctl(uffd, UFFDIO_COPY, &copy_req) == -1) {
+                perror("Error: ioctl(UFFDIO_COPY) failed");
+                pthread_exit(NULL);
+            }
+
+            printf("Listener: Injection complete. Woke main thread.\n");
+            fflush(stdout);
         }
     }
+
     return NULL;
 }
 
@@ -138,10 +175,22 @@ int main(void)
     }
 
     printf("Success: Memory successfully registered with userfaultfd.\n");
+
+    int fd_snapshot = open(FILE_NAME, O_RDONLY);
+
+    if (fd_snapshot == -1) {
+        perror("Error: Couldn't open file.");
+        return 1;
+    }
+
+    struct thread_ctx ctx;
+    ctx.uffd = uffd;
+    ctx.snapshot_fd = fd_snapshot;
+    ctx.ram_base = (uint64_t)guest_ram;
     
     pthread_t fault_thread;
 
-    if (pthread_create(&fault_thread, NULL, fault_handler_thread, (void *)(uintptr_t)uffd) != 0) {
+    if (pthread_create(&fault_thread, NULL, fault_handler_thread, (void *)&ctx) != 0) {
         perror("Error: pthread_create failed");
         return 1;
     }
@@ -155,19 +204,29 @@ int main(void)
 
     printf("Warning: Attempting to read from unmapped memory. The program should hang now...\n");
 
-    // volatile uint8_t dummy_read;
-    // dummy_read = guest_ram[0];
-    // (void)dummy_read;
+    volatile uint8_t dummy_read;
+    dummy_read = guest_ram[0];
+    (void)dummy_read;
 
     // guest_ram[0] = 0xAA;
 
-    volatile uint8_t *trap_ptr = (volatile uint8_t *)guest_ram;
-    trap_ptr[0] = 0xAA;
+    // volatile uint8_t *trap_ptr = (volatile uint8_t *)guest_ram;
+    // trap_ptr[0] = 0xAA;
 
-    printf("CRITICAL FAILURE: If you see this text, the page fault DID NOT HAPPEN!\n");
-    fflush(stdout);
+    // printf("CRITICAL FAILURE: If you see this text, the page fault DID NOT HAPPEN!\n");
+    // fflush(stdout);
 
+    pthread_cancel(fault_thread);
     pthread_join(fault_thread, NULL);
+
+    printf("Success: Main thread woke up! Memory was injected.\n");
+    printf("Verification: guest_ram[0] = 0x%02X\n", guest_ram[0]);
+
+    if (close(fd_snapshot) == -1) {
+        perror("Error: Close failed.");
+    }
+
+    printf("Success: Closing file.\n");
 
     return 0;
 }
